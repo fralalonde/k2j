@@ -24,8 +24,8 @@ kotlin {
 gradlePlugin {
     plugins {
         create("k2j") {
-            id = "com.onomatic.k2j"
-            implementationClass = "com.onomatic.k2j.gradle.K2jPlugin"
+            id = "org.example.k2j"
+            implementationClass = "org.example.k2j.gradle.K2jPlugin"
         }
     }
 }

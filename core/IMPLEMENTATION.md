@@ -5,11 +5,15 @@ Read `AGENTS.md` first — it has the FernFlower API facts and the Java-version 
 
 ## Files you own
 
-- `src/main/kotlin/com/onomatic/k2j/core/AsmSurveyor.kt` (create) — implements `Surveyor`
-- `src/main/kotlin/com/onomatic/k2j/core/FernFlowerDecompiler.kt` (create) — implements `Decompiler`
-- `src/main/kotlin/com/onomatic/k2j/core/JavacValidator.kt` (create) — implements `JavaValidator`
-- `src/main/kotlin/com/onomatic/k2j/core/FileSystemWriter.kt` (create) — implements `OutputWriter`
-- `src/main/kotlin/com/onomatic/k2j/core/Main.kt` (create) — CLI
+- `src/main/kotlin/com/example/k2j/core/AsmSurveyor.kt` (create) — implements `Surveyor`
+- `src/main/kotlin/com/example/k2j/core/FernFlowerDecompiler.kt` (create) — implements `Decompiler`
+- `src/main/kotlin/com/example/k2j/core/JavacValidator.kt` (create) — implements `JavaValidator`
+- `src/main/kotlin/com/example/k2j/core/WildcardCaptureNormalizer.kt` (create) — declaration-site
+  variance repair (see below)
+- `src/main/kotlin/com/example/k2j/core/CompileChecker.kt` (create) — `CompileChecker` +
+  `JavacCompileChecker`, the opt-in compile gate
+- `src/main/kotlin/com/example/k2j/core/FileSystemWriter.kt` (create) — implements `OutputWriter`
+- `src/main/kotlin/com/example/k2j/core/Main.kt` (create) — CLI
 - `src/test/kotlin/...` (create) — tests
 
 The *interface signatures* are frozen: `Surveyor.survey`, `Decompiler.decompile`,
@@ -80,8 +84,100 @@ a rule needs one, but never edit it destructively at run time (deletion tests ru
   preserving every other statement in order. Cover `super()`, `super(args)`, `this(...)`,
   already-leading constructors (no change), constructors with no explicit delegation (Java's
   implicit `super()` is already correct), and constructors inside nested/local classes.
+- `DefaultArgumentConstructorNormalizer` also repairs FernFlower's hoisted argument spills, where a
+  delegation references undeclared `varN` locals and emits their declarations after the call. Inline
+  one or several independently proven spill initializers in argument order and delete only those
+  declarations. A cast around the spill is allowed; compound use is not. Preserve Kotlin's emitted
+  `checkNotNull*(varN, "message")` behavior by wrapping the initializer in
+  `java.util.Objects.requireNonNull(initializer, "message")`.
 - Conservative: an unrecognised shape is left untouched so the parse gate reports it as a per-class
   failure. Never silently drop a class.
+
+### Interface-default repair (class-file-backed, before the parse gate)
+- `InterfaceDefaultSynthesis` restores compiler-generated delegating members FernFlower removes when
+  the class file proves a pure delegation to a direct interface default.
+- FernFlower can also lose the owner in a non-bridge interface default call, rendering bytecode
+  `invokespecial IFace.m` as illegal `super.m()`. Restore `IFace.super.m()` only when ASM proves the
+  owner is a direct superinterface and the bytecode/text occurrence counts agree. Already-qualified,
+  overloaded, transitive, or ambiguous calls are unchanged.
+- These are bytecode-backed repairs. Do not infer interface owners or bridge bodies from Kotlin source
+  or javac wording.
+
+### Enum normalization (post-transform, before the parse gate)
+- Kotlin compiles an enum with constructor parameters into a class that declares the instance fields
+  **before** the constants; FernFlower copies that member order, and javac rejects it
+  (`enum constant expected here`) because a Java enum body must open with its constant list.
+- Lift the whole constant list of every enum body in the unit (nested enums included) to the top of
+  that body, immediately after its `{`, preserving the constants' text, order, commas, trailing `;`
+  and line breaks as one block. Every other member keeps its relative order. A body whose constants
+  are already first is not touched.
+- Second, coupled defect: the class file declares `private static final T[] $VALUES` but FernFlower
+  emits only the `$values()` accessor, so `$ENTRIES = EnumEntriesKt.enumEntries($VALUES)` dangles.
+  Rewrite references to `$VALUES` as `$values()` when the unit declares no such field. Never invent
+  a `$VALUES` field; never remove `getEntries()` or `$values()`. (This one *parses*, so the gate
+  cannot see it — it only fails at `compileJava`.)
+- Conservative, all-or-nothing per unit: an enum body that does not match a provable shape returns
+  the unit unchanged for the gate to report. Never partially rewrite a unit.
+
+### Failure dump (opt-in, all phases)
+- A parse-gate failure names `Class.java:line:col` in text that was never written. `--dump-failures
+  <dir>` (CLI), `k2j { dumpFailures }` / `--dump-failures` (Gradle) writes each failed unit's
+  generated text to `<dir>/<Class>.java` plus `<dir>/<Class>.failure.txt` with the class, phase and
+  reason. Off by default; a dump that cannot be written is a warning, and a dumped failure is still a
+  failure.
+
+### Declaration-site variance normalization (post-transform, before the parse gate)
+- Kotlin's `Map<K, out V>` (declaration-site variance) makes FernFlower emit the *parameter* of the
+  synthesized constructor — and of the `copy(...)` method — as `Map<String, ? extends Number>` while
+  emitting the *field* invariant `Map<String, Number>`. `this.properties = properties;` then fails
+  javac's wildcard-capture rules (`incompatible types: Map<String,CAP#1> cannot be converted to
+  Map<String,Number> where CAP#1 extends Number from capture of ? extends Number`). **The text
+  parses**, so the parse gate cannot see it — this is the defect the compile check exists for.
+- `WildcardCaptureNormalizer` strips the wildcards from exactly the parameters the shape makes safe,
+  by splicing the field's own declared type text over the parameter's type range. All of these must
+  hold, or the unit is returned unchanged:
+  1. the parameter's declared type contains a wildcard (`? extends X` / `? super X`);
+  2. a member-level field of the **same simple name**, with no initializer, is declared in the **same
+     class body** as the declaration carrying the parameter;
+  3. that field's type contains no wildcard (it is invariant);
+  4. the field's type and the parameter's type are **token-identical once the parameter's wildcards
+     are replaced by their bounds**. One comparison proves the erasure, the arity and every type
+     argument match, rules out a raw field, and refuses a bare `?` (nothing to substitute). A
+     `? super X` is accepted only when substituting `X` reproduces the field exactly;
+  5. a **constructor** parameter must be assigned to that field in the body
+     (`this.<name> = <name>;`);
+  6. a **`copy(...)`** parameter must be passed to that same class's constructor
+     (`new <Class>(<name>)`), where the class declares a constructor parameter this pass stripped.
+- The rewrite replaces one parameter's type and nothing else: the field, the getter, `component1`,
+  the synthetic `copy$default`, the annotations, the bodies and the surrounding formatting are carried
+  over byte for byte. A unit with no wildcard anywhere is returned as the same string.
+- Never narrows an unrelated API: only the parameter that is provably assigned to (or passed to the
+  constructor of) a field of the same name and same stripped type is touched.
+- Conservative, per candidate: an unprovable shape is left as the decompiler emitted it, so the gate
+  (parse, and with `--compile-check` the compiler) reports the unit as a per-class failure. A class is
+  never silently half-rewritten and never silently dropped.
+
+### Compile check (opt-in, before the write)
+- The parse gate is syntax only. `--compile-check` (CLI) / `k2j { compileCheck = true }` (Gradle)
+  adds semantic validation between parsing and writing.
+- Compile the complete map of parse-clean generated sources in **one** `JavaCompiler` task. Map each
+  diagnostic back to its `JavaFileObject` URI and then to the owning class. Diagnostics without a
+  source are global and reject every candidate rather than being ignored.
+- Do not compile once per unit and do not implement a repeated settle pass. On large modules that
+  design creates thousands of compiler/file-manager/temp-directory lifecycles and recompiles the
+  same failures. A batch also models the replacement build correctly: generated callers resolve
+  generated callees from the same source surface immediately.
+- After the first batch, `RawTypeFallback` may propose a repair only from javac's own supported
+  diagnostics. Verify each proposal narrowly, revert rejected proposals, then run one authoritative
+  final batch. Record every retained raw fallback in manifest warnings.
+- A rejected unit becomes `ConversionFailure(className, "COMPILE", reason)` with javac's
+  `file:line:column: message`; it is not written and its source cannot be deleted.
+- The classpath is `ConversionRequest.compileClasspath`, the decompiler classpath, and every module
+  classes directory (`classesRoots`). This includes Java peers beside Kotlin output.
+- Keep the gate off by default because it requires a complete dependency classpath. The compiler
+  itself is no longer the volume bottleneck; stock FernFlower dominates measured integration time.
+  Emit phase timings at info level so survey, decompile, normalize/parse, batch compile, and total
+  time are observable.
 
 ### JavacValidator
 - `javax.tools` parser-only check: `JavaCompiler.getTask` with `StandardJavaFileManager`,
@@ -103,7 +199,10 @@ a rule needs one, but never edit it destructively at run time (deletion tests ru
 
 ### Main.kt (CLI)
 - Args: `--classes <dir> --out <dir> [--package p]... [--classpath jar]... [--delete-sources]
-  [--source-root dir]... [--decompiler-jar path] [--runtime-java-home path]`
+  [--source-root dir]... [--dump-failures dir] [--compile-check] [--compile-classpath path]...
+  [--decompiler-jar path] [--runtime-java-home path]`
+  Every flag also accepts `--flag=value`. `--compile-check` is a boolean switch; `--compile-classpath`
+  is repeatable and only read when the switch is on.
 - Defaults: decompiler jar and runtime java home are **development-machine defaults** (a hardcoded
   path into the local Gradle transform cache and the installed IDE JBR). They are NOT vendored or
   checksum-pinned; production callers pass `--decompiler-jar`/`--runtime-java-home`. Print the
@@ -129,6 +228,12 @@ a rule needs one, but never edit it destructively at run time (deletion tests ru
   - validator accepts the decompiled text and rejects `class Broken {`,
   - writer refuses to overwrite,
   - constructor normalization turns a Kotlin-ordered constructor into compilable Java,
+  - wildcard-capture normalization turns the `accept.variance.VarianceProps` decompiler output into
+    text that compiles (and leaves a name-mismatched, differently-erased or wildcarded-field shape
+    alone, so the gate reports it),
+  - the compile check reports a unit javac rejects as a `COMPILE` failure with javac's own
+    file/line/column/message, writes nothing and keeps its source non-deletable, and stays off by
+    default,
   - end-to-end `K2j.convert` on the corpus produces a manifest with `success == true` and
     `deletableSources` containing `Single.kt`, `Bridge.kt`, `CancelActivityLike.kt`, `Outer.kt`
     and NOT `TypeAliases.kt` or `Mixed.kt`.

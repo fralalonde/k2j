@@ -6,18 +6,18 @@ run by the time the task executes, and the task consumes the build's own outputs
 ## Files you own
 
 - `build.gradle.kts`
-- `src/main/kotlin/com/onomatic/k2j/gradle/K2jPlugin.kt`
-- `src/main/kotlin/com/onomatic/k2j/gradle/K2jTask.kt`
-- `src/main/kotlin/com/onomatic/k2j/gradle/K2jExtension.kt`
-- `src/main/kotlin/com/onomatic/k2j/gradle/ClassRoots.kt` (classes-root selection)
-- `src/main/kotlin/com/onomatic/k2j/gradle/KotlinClassDetector.kt` (constant-pool Metadata sniff)
-- `src/main/kotlin/com/onomatic/k2j/gradle/DecompilerArtifact.kt` (vendored jar + pin + verification)
-- `src/main/kotlin/com/onomatic/k2j/gradle/JavaRuntime.kt` (ordered Java 25 probe)
+- `src/main/kotlin/com/example/k2j/gradle/K2jPlugin.kt`
+- `src/main/kotlin/com/example/k2j/gradle/K2jTask.kt`
+- `src/main/kotlin/com/example/k2j/gradle/K2jExtension.kt`
+- `src/main/kotlin/com/example/k2j/gradle/ClassRoots.kt` (classes-root selection)
+- `src/main/kotlin/com/example/k2j/gradle/KotlinClassDetector.kt` (constant-pool Metadata sniff)
+- `src/main/kotlin/com/example/k2j/gradle/DecompilerArtifact.kt` (vendored jar + pin + verification)
+- `src/main/kotlin/com/example/k2j/gradle/JavaRuntime.kt` (ordered Java 25 probe)
 - `src/main/resources/k2j/java-decompiler.jar` (the vendored artifact)
 - `src/test/kotlin/...`, `src/test/java/...`
 
 Do NOT edit: anything under `core/` (read its frozen interfaces from
-`core/src/main/kotlin/com/onomatic/k2j/core/*.kt`), `corpus/`, or the root build files.
+`core/src/main/kotlin/com/example/k2j/core/*.kt`), `corpus/`, or the root build files.
 
 ## Skeleton
 
@@ -73,6 +73,13 @@ dependencies {
   metadata-bearing roots are staged into one merged directory (the frozen `ConversionRequest` takes a
   single `classesRoot`); when none does, or when no candidate directory exists, the task fails with a
   `k2j:`-prefixed message.
+- **Compile gate classpath**: the gate resolves against *every* classes directory of the main source
+  set, not just the selected root (`ClassRoots.compileClasspathRoots` →
+  `ConversionRequest.classesRoots`). The survey needs one root; resolution does not. A module's own
+  Java classes (annotations, utilities) are compiled into `build/classes/java/main` while every Kotlin
+  class lands in `build/classes/kotlin/main`, so a unit referencing one of them used to be rejected
+  with `cannot find symbol` although the `.class` file was on disk. A single-classes-dir project is
+  unaffected: the list de-duplicates against the survey root.
 - **Repeatable**: Gradle does not wipe a declared `@OutputDirectory` between executions and core's
   writer refuses to overwrite (`FileSystemWriter.kt:19`), so the task deletes its own output at the
   start of the action (via injected `FileSystemOperations`). Stale `.java` files for classes that
@@ -93,7 +100,7 @@ dependencies {
   with `File.resolve` so separators never mix (`build\k2j\k2j-manifest.json`).
 - `@TaskAction` must not run on the configuration cache-hostile path: use `providers`/`files`
   properly.
-- Register the task in `K2jPlugin` applied via the `gradle-plugin` block with id `com.onomatic.k2j`.
+- Register the task in `K2jPlugin` applied via the `gradle-plugin` block with id `org.example.k2j`.
 - The plugin must NOT add any dependency on the user's project beyond what `classes` provides.
 
 ## Decompiler pinning
@@ -148,9 +155,10 @@ its reported major version are task inputs; the whole home directory is delibera
   classpath with the configuration cache **stored, reused and correctly reported UP-TO-DATE**.
   Do not try to fix this in Kotlin code here; pass `--no-configuration-cache` when consuming the
   plugin as an included build. The TestKit tests do exactly that.
-- **Core change requested** (not made here — a parallel unit owns `core/`): `ConversionRequest`
-  should take `classesRoots: List<Path>` instead of a single `classesRoot`, so a module whose Kotlin
-  output is split across several directories does not need the plugin's staging merge.
+- **Partially done, `core/` side**: `ConversionRequest` now takes `classesRoots: List<Path>` (default
+  empty, so every existing caller keeps the old classpath) and the compile gate resolves against it.
+  The *survey* still reads the single `classesRoot`, so the staging merge stays: making the survey
+  read a list is the remaining core change, and it would only remove the staging copy, not a defect.
 - `sourceRoots` scoping assumes KGP registers Kotlin source dirs in `allJava`. If a project keeps
   `.kt` files under a Java source dir, the dirs cannot be separated and the plugin falls back to all
   of `allJava` (logged at info level).

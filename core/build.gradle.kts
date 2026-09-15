@@ -34,5 +34,5 @@ kotlin {
 }
 
 application {
-    mainClass.set("com.onomatic.k2j.core.MainKt")
+    mainClass.set("org.example.k2j.core.MainKt")
 }
